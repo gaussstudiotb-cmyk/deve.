@@ -131,11 +131,28 @@ class Brain(private val prefs: SharedPreferences) {
             )
             .put("tools", JSONArray().put(JSONObject().put("functionDeclarations", decls)))
 
-        val res = post(
-            "https://generativelanguage.googleapis.com/v1beta/models/$GEMINI_MODEL:generateContent",
-            mapOf("x-goog-api-key" to key), body
+        val url = "https://generativelanguage.googleapis.com/v1beta/models/$GEMINI_MODEL:generateContent"
+        val headers = mapOf("x-goog-api-key" to key)
+        // La « réflexion » de Gemini ajoute plusieurs secondes : on la coupe, selon ce que le modèle accepte.
+        val configs = listOf(
+            JSONObject().put("maxOutputTokens", 300)
+                .put("thinkingConfig", JSONObject().put("thinkingBudget", 0)),
+            JSONObject().put("maxOutputTokens", 300)
+                .put("thinkingConfig", JSONObject().put("thinkingLevel", "minimal")),
+            null
         )
-        val parts = res.optJSONArray("candidates")?.optJSONObject(0)
+        var res: JSONObject? = null
+        for ((i, cfg) in configs.withIndex()) {
+            if (cfg != null) body.put("generationConfig", cfg) else body.remove("generationConfig")
+            try {
+                res = post(url, headers, body)
+                break
+            } catch (e: HttpException) {
+                if (e.code != 400 || i == configs.lastIndex) throw e
+            }
+        }
+        if (res == null) return Result("Je n'ai pas compris.", null)
+        val parts = res!!.optJSONArray("candidates")?.optJSONObject(0)
             ?.optJSONObject("content")?.optJSONArray("parts")
             ?: return Result("Je n'ai pas compris.", null)
 

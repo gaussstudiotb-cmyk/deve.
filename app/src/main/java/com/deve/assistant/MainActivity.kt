@@ -30,6 +30,7 @@ class MainActivity : Activity() {
     private lateinit var prefs: SharedPreferences
     private lateinit var status: TextView
     private lateinit var keyField: EditText
+    private lateinit var journal: TextView
     private var provider = "gemini"
     private val ui = Handler(Looper.getMainLooper())
 
@@ -136,6 +137,15 @@ class MainActivity : Activity() {
             refresh()
         })
 
+        root.addView(android.widget.Switch(this).apply {
+            text = "Démarrer DeVE automatiquement"
+            setTextColor(Color.WHITE)
+            setPadding(0, dp(22), 0, 0)
+            isChecked = prefs.getBoolean("autostart", true)
+            setOnCheckedChangeListener { _, on -> prefs.edit().putBoolean("autostart", on).apply() }
+        })
+        root.addView(label("À l'ouverture de l'appli et au démarrage du téléphone.", 12f, soft))
+
         root.addView(button("▶  Démarrer DeVE", rose) { startDeve(false) }.apply {
             (layoutParams as LinearLayout.LayoutParams).topMargin = dp(28)
         })
@@ -145,10 +155,28 @@ class MainActivity : Activity() {
             ui.postDelayed({ refresh() }, 500)
         })
 
+        root.addView(label("Journal de DeVE", 14f).apply { setPadding(0, dp(30), 0, 0) })
+        root.addView(label("Si quelque chose bloque, envoie-moi une capture de ce journal.", 12f, soft))
+        root.addView(button("Actualiser le journal", Color.parseColor("#3A2A55")) { refresh() })
+        journal = label("", 11f, Color.parseColor("#9C8AB8")).apply {
+            typeface = Typeface.MONOSPACE
+            setPadding(0, dp(12), 0, 0)
+        }
+        root.addView(journal)
+
         setContentView(ScrollView(this).apply {
             setBackgroundColor(Color.parseColor("#1A0B2E"))
             addView(root)
         })
+
+        autoStartIfReady()
+    }
+
+    private fun autoStartIfReady() {
+        if (!prefs.getBoolean("autostart", true) || DeveService.running) return
+        if (!has(Manifest.permission.RECORD_AUDIO)) return
+        if (prefs.getString("key_$provider", "").isNullOrBlank()) return
+        startDeve(false)
     }
 
     override fun onResume() {
@@ -198,5 +226,8 @@ class MainActivity : Activity() {
                 "${m(DeveAccessibilityService.instance != null)} Accessibilité\n" +
                 "${m(keyOk)} Clé API\n" +
                 "${m(DeveService.running)} DeVE actif"
+        if (::journal.isInitialized) {
+            journal.text = prefs.getString("trace", "")?.ifBlank { "(vide pour l'instant)" }
+        }
     }
 }

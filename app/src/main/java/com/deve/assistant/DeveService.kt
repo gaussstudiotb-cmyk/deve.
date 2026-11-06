@@ -6,7 +6,9 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.content.ContentValues
+import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
 import android.content.pm.ServiceInfo
 import android.graphics.PixelFormat
 import android.graphics.drawable.Icon
@@ -36,7 +38,7 @@ import java.util.concurrent.Executors
 
 /**
  * Service au premier plan : écoute en continu, attend « DeVE », affiche l'orbe,
- * envoie la demande au cerveau, parle, puis exécute l'action.
+ * comprend la demande (règles locales ou IA), exécute l'action, puis répond à voix haute.
  */
 class DeveService : Service() {
 
@@ -54,14 +56,36 @@ class DeveService : Service() {
         // Mot d'éveil : « DeVE » est souvent transcrit dev / dève / dave.
         private val WAKE = Regex(
             "(?<![\\p{L}])(?:deve|dève|dév|dev|dave)(?![\\p{L}])",
-            setOf(RegexOption.IGNORE_CASE, RegexOption.UNICODE_CASE)
+            setOf(RegexOption.IGNORE_CASE)
         )
+
+        /** Notification « touche pour réactiver » quand Android refuse le démarrage automatique. */
+        fun notifyRestart(ctx: Context) {
+            val nm = ctx.getSystemService(NotificationManager::class.java)
+            nm.createNotificationChannel(
+                NotificationChannel(CHANNEL, "DeVE", NotificationManager.IMPORTANCE_LOW)
+            )
+            val open = PendingIntent.getActivity(
+                ctx, 2,
+                Intent(ctx, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                PendingIntent.FLAG_IMMUTABLE
+            )
+            val n = Notification.Builder(ctx, CHANNEL)
+                .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+                .setContentTitle("DeVE est arrêté")
+                .setContentText("Touche pour le réactiver")
+                .setContentIntent(open)
+                .setAutoCancel(true)
+                .build()
+            nm.notify(2, n)
+        }
     }
 
     private val main = Handler(Looper.getMainLooper())
     private val io = Executors.newSingleThreadExecutor()
 
     private lateinit var wm: WindowManager
+    private lateinit var prefs: SharedPreferences
     private lateinit var brain: Brain
     private lateinit var actions: Actions
 
@@ -80,6 +104,18 @@ class DeveService : Service() {
     private var recorder: MediaRecorder? = null
     private var recordingPfd: ParcelFileDescriptor? = null
 
+    // ------------------------------------------------------------ journal (visible dans l'appli)
+
+    private fun trace(msg: String) {
+        try {
+            val t = SimpleDateFormat("HH:mm:ss", Locale.FRANCE).format(Date())
+            val old = (prefs.getString("trace", "") ?: "").lines().filter { it.isNotBlank() }.takeLast(11)
+            prefs.edit().putString("trace", (old + "$t $msg").joinToString("\n")).apply()
+        } catch (e: Exception) {
+            Log.e(TAG, "trace", e)
+        }
+    }
+
     // ------------------------------------------------------------ cycle de vie
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -87,7 +123,8 @@ class DeveService : Service() {
     override fun onCreate() {
         super.onCreate()
         wm = getSystemService(WINDOW_SERVICE) as WindowManager
-        brain = Brain(getSharedPreferences("deve", MODE_PRIVATE))
+        prefs = getSharedPreferences("deve", MODE_PRIVATE)
+        brain = Brain(prefs)
         actions = Actions(this, this)
         tts = TextToSpeech(this) { status ->
             if (status == TextToSpeech.SUCCESS) {
@@ -112,6 +149,8 @@ class DeveService : Service() {
                     }
                 })
                 ttsReady = true
+            } else {
+                trace("voix de synthèse indisponible")
             }
         }
     }
@@ -123,12 +162,20 @@ class DeveService : Service() {
         }
         if (!startAsForeground()) return START_NOT_STICKY
         running = true
+        val trigger = intent?.action == ACTION_TRIGGER
         if (!started) {
             started = true
             setupRecognizer()
+            if (trigger) {
+                // Démarrage direct en mode commande : une seule ouverture du micro, plus rapide.
+                mode = Mode.COMMAND
+                showOrb(OrbView.State.LISTENING)
+            }
             listen()
+            trace("DeVE démarré")
+        } else if (trigger && mode != Mode.BUSY) {
+            enterCommand()
         }
-        if (intent?.action == ACTION_TRIGGER && mode != Mode.BUSY) enterCommand()
         return START_STICKY
     }
 
@@ -173,7 +220,7 @@ class DeveService : Service() {
             true
         } catch (e: Exception) {
             Log.e(TAG, "startForeground refusé", e)
-            toast("DeVE ne peut pas démarrer : autorise le micro puis relance depuis l'appli.")
+            notifyRestart(this)
             stopSelf()
             false
         }
@@ -184,6 +231,7 @@ class DeveService : Service() {
     private fun setupRecognizer() {
         if (!SpeechRecognizer.isRecognitionAvailable(this)) {
             toast("Reconnaissance vocale indisponible : installe ou active l'appli Google.")
+            trace("reconnaissance vocale indisponible")
             stopSelf()
             return
         }
@@ -209,6 +257,9 @@ class DeveService : Service() {
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
             putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
             putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, packageName)
+            // Termine l'écoute plus vite quand tu as fini de parler.
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 900L)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 700L)
         }
         try {
             recognizer?.startListening(i)
@@ -218,8 +269,15 @@ class DeveService : Service() {
         }
     }
 
+    // Si tu dis seulement « DeVE » puis tu marques une pause, on n'attend pas la fin de l'écoute.
+    private val earlyWake = Runnable { if (mode == Mode.WAKE) enterCommand() }
+
     private val listener = object : RecognitionListener {
-        override fun onReadyForSpeech(params: Bundle?) {}
+        override fun onReadyForSpeech(params: Bundle?) {
+            // Petit battement de l'orbe : « je t'écoute maintenant ».
+            if (mode == Mode.COMMAND) orb?.setLevel(0.7f)
+        }
+
         override fun onBeginningOfSpeech() {}
         override fun onRmsChanged(rmsdB: Float) {
             orb?.setLevel((rmsdB + 2f) / 12f)
@@ -233,7 +291,10 @@ class DeveService : Service() {
             if (mode != Mode.WAKE) return
             val t = partialResults
                 ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull() ?: return
-            if (afterWake(t) != null) showOrb(OrbView.State.LISTENING)
+            val rest = afterWake(t) ?: return
+            showOrb(OrbView.State.LISTENING)
+            main.removeCallbacks(earlyWake)
+            if (rest.isEmpty()) main.postDelayed(earlyWake, 700)
         }
 
         override fun onResults(results: Bundle?) {
@@ -259,11 +320,12 @@ class DeveService : Service() {
             Mode.WAKE -> {
                 for (t in list) {
                     val rest = afterWake(t) ?: continue
+                    main.removeCallbacks(earlyWake)
                     if (rest.length >= 3) process(rest) else enterCommand()
                     return
                 }
                 hideOrb()
-                listenLater(150)
+                listenLater(100)
             }
             Mode.COMMAND -> {
                 val raw = list.firstOrNull()?.trim().orEmpty()
@@ -276,6 +338,9 @@ class DeveService : Service() {
 
     private fun handleError(code: Int) {
         if (mode == Mode.BUSY) return
+        if (code != SpeechRecognizer.ERROR_NO_MATCH && code != SpeechRecognizer.ERROR_SPEECH_TIMEOUT) {
+            trace("micro : erreur $code")
+        }
         if (code == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) {
             toast("Autorise le micro dans l'appli DeVE.")
             stopSelf()
@@ -293,43 +358,82 @@ class DeveService : Service() {
             }
             SpeechRecognizer.ERROR_NETWORK, SpeechRecognizer.ERROR_NETWORK_TIMEOUT,
             SpeechRecognizer.ERROR_SERVER -> listenLater(3000)
-            else -> listenLater(250)
+            else -> listenLater(100)
         }
     }
 
     private fun enterCommand() {
+        main.removeCallbacks(earlyWake)
         mode = Mode.COMMAND
         showOrb(OrbView.State.LISTENING)
         recognizer?.cancel()
-        listenLater(250)
+        listenLater(100)
     }
 
     private fun backToWake() {
+        main.removeCallbacks(earlyWake)
         mode = Mode.WAKE
         hideOrb()
-        listenLater(300)
+        listenLater(200)
     }
 
     // ------------------------------------------------------------ traitement
 
     private fun process(text: String) {
         mode = Mode.BUSY
+        main.removeCallbacks(earlyWake)
         recognizer?.cancel()
         showOrb(OrbView.State.THINKING)
+        trace("entendu : $text")
         val id = ++requestId
+
+        // 1) Commande simple : exécutée tout de suite, sans IA.
+        val local = LocalParser.parse(text)
+        if (local != null) {
+            trace("commande locale : ${local.name}")
+            execute(local)
+            return
+        }
+
+        // 2) Sinon, on demande à l'IA.
         io.execute {
             val r = brain.ask(text)
             main.post {
                 if (id != requestId || !running) return@post
                 val call = r.call
                 if (call != null) {
-                    val plan = actions.plan(call.name, call.args)
-                    say(plan.message, plan.run)
+                    trace("IA : ${call.name}")
+                    execute(call)
                 } else {
+                    trace("IA : réponse texte")
                     say(r.text ?: "Je n'ai pas compris.")
                 }
             }
         }
+    }
+
+    /** Exécute l'action tout de suite, puis annonce le résultat à voix haute. */
+    private fun execute(call: Brain.Call) {
+        val plan = actions.plan(call.name, call.args)
+        if (plan.afterSpeech) {
+            say(plan.message, plan.run)
+            return
+        }
+        try {
+            plan.run?.invoke()
+            trace("action ${call.name} : lancée")
+        } catch (e: Exception) {
+            Log.e(TAG, "Action échouée", e)
+            trace("action ${call.name} échouée : ${e.javaClass.simpleName}")
+            say("Je n'ai pas réussi à le faire.")
+            return
+        }
+        say(plan.message)
+    }
+
+    private val speakTimeout = Runnable {
+        tts?.stop()
+        finishSpeaking()
     }
 
     private fun say(text: String, after: (() -> Unit)? = null) {
@@ -337,6 +441,8 @@ class DeveService : Service() {
         pendingAction = after
         speaking = true
         showOrb(OrbView.State.SPEAKING)
+        main.removeCallbacks(speakTimeout)
+        main.postDelayed(speakTimeout, 15000)
         val ok = ttsReady &&
             tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "deve") == TextToSpeech.SUCCESS
         if (!ok) finishSpeaking()
@@ -345,12 +451,14 @@ class DeveService : Service() {
     private fun finishSpeaking() {
         if (!speaking) return
         speaking = false
+        main.removeCallbacks(speakTimeout)
         val action = pendingAction
         pendingAction = null
         try {
             action?.invoke()
         } catch (e: Exception) {
             Log.e(TAG, "Action échouée", e)
+            trace("action échouée : ${e.javaClass.simpleName}")
         }
         val retry = deferredSay
         if (retry != null) {
@@ -393,6 +501,7 @@ class DeveService : Service() {
             r.start()
         } catch (e: Exception) {
             Log.e(TAG, "MediaRecorder", e)
+            trace("enregistrement impossible : ${e.javaClass.simpleName}")
             r.release()
             pfd.close()
             contentResolver.delete(uri, null, null)
@@ -401,6 +510,7 @@ class DeveService : Service() {
         }
         recorder = r
         recordingPfd = pfd
+        trace("enregistrement : $name")
         main.removeCallbacks(stopRecRunnable)
         main.postDelayed(stopRecRunnable, seconds * 1000L)
     }

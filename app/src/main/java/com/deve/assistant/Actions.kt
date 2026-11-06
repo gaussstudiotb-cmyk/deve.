@@ -12,7 +12,12 @@ import java.text.Normalizer
 import java.util.Locale
 
 /** Ce que DeVE dit à voix haute, puis exécute une fois la phrase terminée. */
-class Plan(val message: String, val run: (() -> Unit)? = null)
+class Plan(
+    val message: String,
+    /** true : on parle d'abord, puis on exécute (utile pour l'enregistrement, pour ne pas s'enregistrer soi-même). */
+    val afterSpeech: Boolean = false,
+    val run: (() -> Unit)? = null
+)
 
 class Actions(private val ctx: Context, private val svc: DeveService) {
 
@@ -51,7 +56,7 @@ class Actions(private val ctx: Context, private val svc: DeveService) {
             number = lookupContact(who) ?: return Plan("Je ne trouve pas $who dans tes contacts.")
         }
         return Plan("J'appelle ${if (isNumber) "ce numéro" else who}.") {
-            ctx.startActivity(
+            go(
                 Intent(Intent.ACTION_CALL, Uri.parse("tel:" + Uri.encode(number)))
                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             )
@@ -122,7 +127,7 @@ class Actions(private val ctx: Context, private val svc: DeveService) {
         val cls = bestCls
         if (pkg == null || cls == null) return Plan("Je ne trouve pas l'application $name.")
         return Plan("J'ouvre $bestLabel.") {
-            ctx.startActivity(
+            go(
                 Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
                     .setClassName(pkg, cls)
                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED)
@@ -142,7 +147,7 @@ class Actions(private val ctx: Context, private val svc: DeveService) {
     private fun record(seconds: Int): Plan {
         val s = seconds.coerceIn(5, 3600)
         val dur = if (s >= 120) "${s / 60} minutes" else "$s secondes"
-        return Plan("J'enregistre pendant $dur. Touche l'orbe pour arrêter.") { svc.startRecording(s) }
+        return Plan("J'enregistre pendant $dur. Touche l'orbe pour arrêter.", afterSpeech = true) { svc.startRecording(s) }
     }
 
     // ---------- Alarme ----------
@@ -150,7 +155,7 @@ class Actions(private val ctx: Context, private val svc: DeveService) {
         if (h !in 0..23 || m !in 0..59) return Plan("Je n'ai pas compris l'heure de l'alarme.")
         val spoken = "Alarme réglée à ${h} heures" + if (m > 0) " $m" else ""
         return Plan("$spoken.") {
-            ctx.startActivity(
+            go(
                 Intent(AlarmClock.ACTION_SET_ALARM)
                     .putExtra(AlarmClock.EXTRA_HOUR, h)
                     .putExtra(AlarmClock.EXTRA_MINUTES, m)
@@ -159,5 +164,23 @@ class Actions(private val ctx: Context, private val svc: DeveService) {
                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             )
         }
+    }
+
+    /**
+     * Lance une activité. Depuis un service en arrière-plan, Android bloque parfois le lancement :
+     * on passe par le service d'accessibilité quand il est actif, car il y est autorisé.
+     */
+    private fun go(intent: Intent) {
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        val a11y = DeveAccessibilityService.instance
+        if (a11y != null) {
+            try {
+                a11y.startActivity(intent)
+                return
+            } catch (e: Exception) {
+                // repli ci-dessous
+            }
+        }
+        ctx.startActivity(intent)
     }
 }
