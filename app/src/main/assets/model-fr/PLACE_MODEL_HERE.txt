@@ -1,0 +1,1 @@
+Place ici le contenu décompressé de vosk-model-small-fr-0.22.zip (pas le dossier parent).

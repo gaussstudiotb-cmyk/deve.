@@ -13,6 +13,8 @@ import android.content.pm.ServiceInfo
 import android.graphics.PixelFormat
 import android.graphics.drawable.Icon
 import android.media.MediaRecorder
+import android.media.AudioManager
+import android.media.ToneGenerator
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
@@ -22,9 +24,6 @@ import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.provider.MediaStore
 import android.provider.Settings
-import android.speech.RecognitionListener
-import android.speech.RecognizerIntent
-import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.util.Log
@@ -55,7 +54,7 @@ class DeveService : Service() {
 
         // Mot d'éveil : « DeVE » est souvent transcrit dev / dève / dave.
         private val WAKE = Regex(
-            "(?<![\\p{L}])(?:deve|dève|dév|dev|dave)(?![\\p{L}])",
+            "(?<![\\p{L}])(?:deve|dève|dév|dev|dave|deux\\s+v|d\\s+v)(?![\\p{L}])",
             setOf(RegexOption.IGNORE_CASE)
         )
 
@@ -89,7 +88,9 @@ class DeveService : Service() {
     private lateinit var brain: Brain
     private lateinit var actions: Actions
 
-    private var recognizer: SpeechRecognizer? = null
+    private var voiceEngine: OfflineVoiceEngine? = null
+    private var edgeGlow: EdgeGlowView? = null
+    private var startupBeepPlayed = false
     private var tts: TextToSpeech? = null
     private var ttsReady = false
     private var mode = Mode.WAKE
@@ -162,10 +163,12 @@ class DeveService : Service() {
         }
         if (!startAsForeground()) return START_NOT_STICKY
         running = true
+        createEdgeGlow()
         val trigger = intent?.action == ACTION_TRIGGER
         if (!started) {
             started = true
-            setupRecognizer()
+            setupOfflineVoice()
+            playStartupBeepOnce()
             if (trigger) {
                 // Démarrage direct en mode commande : une seule ouverture du micro, plus rapide.
                 mode = Mode.COMMAND
@@ -184,7 +187,9 @@ class DeveService : Service() {
         main.removeCallbacksAndMessages(null)
         stopRecording(false)
         hideOrb()
-        recognizer?.destroy()
+        removeEdgeGlow()
+        voiceEngine?.release()
+        voiceEngine = null
         tts?.shutdown()
         io.shutdownNow()
         super.onDestroy()
@@ -228,16 +233,53 @@ class DeveService : Service() {
 
     // ------------------------------------------------------------ écoute
 
-    private fun setupRecognizer() {
-        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
-            toast("Reconnaissance vocale indisponible : installe ou active l'appli Google.")
-            trace("reconnaissance vocale indisponible")
-            stopSelf()
-            return
+    private fun setupOfflineVoice() {
+        if (voiceEngine != null) return
+        voiceEngine = OfflineVoiceEngine(this, object : OfflineVoiceEngine.Callbacks {
+            override fun onPartial(text: String) {
+                if (mode == Mode.COMMAND) {
+                    orb?.setLevel(0.65f)
+                    return
+                }
+                if (mode != Mode.WAKE) return
+                val rest = afterWake(text) ?: return
+                showOrb(OrbView.State.LISTENING)
+                orb?.setLevel(0.45f)
+                main.removeCallbacks(earlyWake)
+                if (rest.isEmpty()) main.postDelayed(earlyWake, 700)
+            }
+
+            override fun onFinal(text: String) {
+                handleResults(listOf(text))
+            }
+
+            override fun onError(message: String) {
+                trace("voix locale : $message")
+                toast(message)
+                if (message.contains("absent", ignoreCase = true) ||
+                    message.contains("modèle", ignoreCase = true)) {
+                    stopSelf()
+                } else if (running && mode != Mode.BUSY) {
+                    voiceEngine?.stop()
+                    listenLater(900)
+                }
+            }
+        })
+        voiceEngine?.initialize {
+            trace("modèle français Vosk prêt (hors ligne)")
+            listenLater(150)
         }
-        recognizer?.destroy()
-        recognizer = SpeechRecognizer.createSpeechRecognizer(this).apply {
-            setRecognitionListener(listener)
+    }
+
+    private fun playStartupBeepOnce() {
+        if (startupBeepPlayed) return
+        startupBeepPlayed = true
+        try {
+            val tone = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 65)
+            tone.startTone(ToneGenerator.TONE_PROP_BEEP, 110)
+            main.postDelayed({ tone.release() }, 250)
+        } catch (e: Exception) {
+            Log.w(TAG, "Bip de démarrage indisponible", e)
         }
     }
 
@@ -251,64 +293,14 @@ class DeveService : Service() {
     private fun listen() {
         main.removeCallbacks(listenRunnable)
         if (mode == Mode.BUSY || !running) return
-        val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE, "fr-FR")
-            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
-            putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, packageName)
-            // Termine l'écoute plus vite quand tu as fini de parler.
-            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 900L)
-            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 700L)
-        }
-        try {
-            recognizer?.startListening(i)
-        } catch (e: Exception) {
-            Log.e(TAG, "startListening", e)
-            listenLater(1500)
-        }
+        voiceEngine?.start()
     }
 
-    // Si tu dis seulement « DeVE » puis tu marques une pause, on n'attend pas la fin de l'écoute.
-    private val earlyWake = Runnable { if (mode == Mode.WAKE) enterCommand() }
-
-    private val listener = object : RecognitionListener {
-        override fun onReadyForSpeech(params: Bundle?) {
-            // Petit battement de l'orbe : « je t'écoute maintenant ».
-            if (mode == Mode.COMMAND) orb?.setLevel(0.7f)
-        }
-
-        override fun onBeginningOfSpeech() {}
-        override fun onRmsChanged(rmsdB: Float) {
-            orb?.setLevel((rmsdB + 2f) / 12f)
-        }
-
-        override fun onBufferReceived(buffer: ByteArray?) {}
-        override fun onEndOfSpeech() {}
-        override fun onEvent(eventType: Int, params: Bundle?) {}
-
-        override fun onPartialResults(partialResults: Bundle?) {
-            if (mode != Mode.WAKE) return
-            val t = partialResults
-                ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull() ?: return
-            val rest = afterWake(t) ?: return
-            showOrb(OrbView.State.LISTENING)
-            main.removeCallbacks(earlyWake)
-            if (rest.isEmpty()) main.postDelayed(earlyWake, 700)
-        }
-
-        override fun onResults(results: Bundle?) {
-            handleResults(
-                results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION) ?: arrayListOf()
-            )
-        }
-
-        override fun onError(error: Int) {
-            handleError(error)
-        }
+    private val earlyWake = Runnable {
+        if (mode == Mode.WAKE) enterCommand()
     }
 
-    /** Renvoie ce qui suit « DeVE » (éventuellement vide), ou null si le mot d'éveil est absent. */
+    /** Renvoie ce qui suit « DeVE » ou null si le mot d'éveil est absent. */
     private fun afterWake(t: String): String? {
         val m = WAKE.find(t) ?: return null
         if (m.range.first > 14) return null
@@ -325,40 +317,26 @@ class DeveService : Service() {
                     return
                 }
                 hideOrb()
-                listenLater(100)
+                voiceEngine?.stop()
+                listenLater(120)
             }
             Mode.COMMAND -> {
                 val raw = list.firstOrNull()?.trim().orEmpty()
-                val text = (afterWake(raw) ?: raw).trim()
-                if (text.isEmpty()) backToWake() else process(text)
+                val wakeRemainder = afterWake(raw)
+                val text = (wakeRemainder ?: raw).trim()
+                if (text.isEmpty()) {
+                    // Ignore le résultat tardif contenant uniquement le mot d'éveil.
+                    if (wakeRemainder != null) {
+                        voiceEngine?.stop()
+                        listenLater(100)
+                    } else {
+                        backToWake()
+                    }
+                } else {
+                    process(text)
+                }
             }
             Mode.BUSY -> {}
-        }
-    }
-
-    private fun handleError(code: Int) {
-        if (mode == Mode.BUSY) return
-        if (code != SpeechRecognizer.ERROR_NO_MATCH && code != SpeechRecognizer.ERROR_SPEECH_TIMEOUT) {
-            trace("micro : erreur $code")
-        }
-        if (code == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) {
-            toast("Autorise le micro dans l'appli DeVE.")
-            stopSelf()
-            return
-        }
-        if (mode == Mode.COMMAND) {
-            backToWake()
-            return
-        }
-        hideOrb()
-        when (code) {
-            SpeechRecognizer.ERROR_RECOGNIZER_BUSY, SpeechRecognizer.ERROR_CLIENT -> {
-                setupRecognizer()
-                listenLater(1200)
-            }
-            SpeechRecognizer.ERROR_NETWORK, SpeechRecognizer.ERROR_NETWORK_TIMEOUT,
-            SpeechRecognizer.ERROR_SERVER -> listenLater(3000)
-            else -> listenLater(100)
         }
     }
 
@@ -366,7 +344,7 @@ class DeveService : Service() {
         main.removeCallbacks(earlyWake)
         mode = Mode.COMMAND
         showOrb(OrbView.State.LISTENING)
-        recognizer?.cancel()
+        voiceEngine?.stop()
         listenLater(100)
     }
 
@@ -374,6 +352,7 @@ class DeveService : Service() {
         main.removeCallbacks(earlyWake)
         mode = Mode.WAKE
         hideOrb()
+        voiceEngine?.stop()
         listenLater(200)
     }
 
@@ -382,7 +361,7 @@ class DeveService : Service() {
     private fun process(text: String) {
         mode = Mode.BUSY
         main.removeCallbacks(earlyWake)
-        recognizer?.cancel()
+        voiceEngine?.stop()
         showOrb(OrbView.State.THINKING)
         trace("entendu : $text")
         val id = ++requestId
@@ -536,6 +515,34 @@ class DeveService : Service() {
 
     // ------------------------------------------------------------ orbe
 
+    private fun createEdgeGlow() {
+        if (edgeGlow != null || !Settings.canDrawOverlays(this)) return
+        val density = resources.displayMetrics.density
+        val view = EdgeGlowView(this)
+        val lp = WindowManager.LayoutParams(
+            (4 * density).toInt().coerceAtLeast(3),
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply { gravity = Gravity.LEFT or Gravity.TOP }
+        try {
+            wm.addView(view, lp)
+            edgeGlow = view
+        } catch (e: Exception) {
+            Log.w(TAG, "Bordure néon indisponible", e)
+        }
+    }
+
+    private fun removeEdgeGlow() {
+        edgeGlow?.let {
+            try { wm.removeView(it) } catch (_: Exception) {}
+        }
+        edgeGlow = null
+    }
+
     private fun onOrbTap() {
         when {
             recorder != null -> stopRecording(true)
@@ -545,7 +552,7 @@ class DeveService : Service() {
             }
             else -> {
                 requestId++
-                recognizer?.cancel()
+                voiceEngine?.stop()
                 backToWake()
             }
         }
