@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">DeVE</string>
+    <string name="a11y_desc">DeVE utilise ce service uniquement pour revenir à l\'écran d\'accueil et fermer des applications quand tu le demandes.</string>
+</resources>
