@@ -108,7 +108,6 @@ class DeveService : Service() {
     private var deferredSay: String? = null
 
     private var orb: OrbView? = null
-    private var neon: NeonBorderView? = null
 
     private var recorder: MediaRecorder? = null
     private var recordingPfd: ParcelFileDescriptor? = null
@@ -194,7 +193,6 @@ class DeveService : Service() {
         main.removeCallbacksAndMessages(null)
         stopRecording(false)
         hideOrb()
-        removeNeon()
         recognizer?.destroy()
         tts?.shutdown()
         io.shutdownNow()
@@ -237,14 +235,13 @@ class DeveService : Service() {
         }
     }
 
-    // ------------------------------------------------------------ activation : bip, orbe, néon
+    // ------------------------------------------------------------ activation : bip et orbe
 
-    /** Une seule fois par activation : bip, orbe visible tout de suite, trait néon sur le bord de l'écran. */
+    /** Une seule fois par activation : l'orbe s'affiche tout de suite, avec un bip. */
     private fun activate() {
         activated = true
         showOrb(OrbView.State.LISTENING)
         beep()
-        neonOnce()
     }
 
     private fun beep() {
@@ -256,38 +253,6 @@ class DeveService : Service() {
         } catch (e: Exception) {
             Log.e(TAG, "bip", e)
         }
-    }
-
-    private fun neonOnce() {
-        if (!Settings.canDrawOverlays(this)) return
-        removeNeon()
-        val v = NeonBorderView(this) { removeNeon() }
-        val lp = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-            PixelFormat.TRANSLUCENT
-        )
-        try {
-            wm.addView(v, lp)
-            neon = v
-        } catch (e: Exception) {
-            Log.e(TAG, "Néon impossible", e)
-        }
-    }
-
-    private fun removeNeon() {
-        neon?.let {
-            try {
-                wm.removeView(it)
-            } catch (ignored: Exception) {
-            }
-        }
-        neon = null
     }
 
     // ------------------------------------------------------------ écoute
