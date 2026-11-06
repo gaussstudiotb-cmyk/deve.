@@ -1,52 +1,30 @@
-name: Build DeVE APK
-
+name: Build APK
 on:
   push:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Récupérer le dépôt
-        uses: actions/checkout@v4
-
-      - name: Installer Java 17
-        uses: actions/setup-java@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
-
-      - name: Installer Gradle
-        uses: gradle/actions/setup-gradle@v4
+          java-version: 17
+      - name: Accepter les licences Android
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+      - uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: '8.7'
-
-      - name: Préparer le modèle français Vosk hors ligne
-        shell: bash
-        run: |
-          set -euo pipefail
-          MODEL_DIR="app/src/main/assets/model-fr"
-          mkdir -p "$MODEL_DIR"
-          curl -fL --retry 3 \
-            https://alphacephei.com/vosk/models/vosk-model-small-fr-0.22.zip \
-            -o /tmp/vosk-fr.zip
-          unzip -q /tmp/vosk-fr.zip -d /tmp/vosk-fr
-          cp -a /tmp/vosk-fr/vosk-model-small-fr-0.22/. "$MODEL_DIR/"
-          test -d "$MODEL_DIR/am"
-          test -d "$MODEL_DIR/conf"
-          echo "Modèle Vosk français installé dans $MODEL_DIR"
-
-      - name: Compiler l'APK debug
+          gradle-version: "8.7"
+      - name: Compiler l'APK
         run: gradle assembleDebug --no-daemon --stacktrace
-
-      - name: Publier l'APK comme artefact téléchargeable
-        uses: actions/upload-artifact@v4
+      - name: Publier l'APK (onglet Releases)
+        uses: softprops/action-gh-release@v2
         with:
-          name: deve-debug-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
-          if-no-files-found: error
-          retention-days: 14
+          tag_name: build-${{ github.run_number }}
+          name: DeVE build ${{ github.run_number }}
+          files: app/build/outputs/apk/debug/app-debug.apk

@@ -31,6 +31,7 @@ class MainActivity : Activity() {
     private lateinit var status: TextView
     private lateinit var keyField: EditText
     private lateinit var journal: TextView
+    private lateinit var memoryView: TextView
     private var provider = "gemini"
     private val ui = Handler(Looper.getMainLooper())
 
@@ -145,6 +146,13 @@ class MainActivity : Activity() {
             setOnCheckedChangeListener { _, on -> prefs.edit().putBoolean("autostart", on).apply() }
         })
         root.addView(label("À l'ouverture de l'appli et au démarrage du téléphone.", 12f, soft))
+        root.addView(android.widget.Switch(this).apply {
+            text = "Bip à l'activation"
+            setTextColor(Color.WHITE)
+            setPadding(0, dp(14), 0, 0)
+            isChecked = prefs.getBoolean("beep", true)
+            setOnCheckedChangeListener { _, on -> prefs.edit().putBoolean("beep", on).apply() }
+        })
 
         root.addView(button("▶  Démarrer DeVE", rose) { startDeve(false) }.apply {
             (layoutParams as LinearLayout.LayoutParams).topMargin = dp(28)
@@ -154,6 +162,12 @@ class MainActivity : Activity() {
             stopService(Intent(this, DeveService::class.java))
             ui.postDelayed({ refresh() }, 500)
         })
+
+        root.addView(label("Mémoire de DeVE", 14f).apply { setPadding(0, dp(30), 0, 0) })
+        root.addView(label("Dis « DeVE, retiens que… » ou raconte-lui des choses sur toi.", 12f, soft))
+        memoryView = label("", 11f, Color.parseColor("#9C8AB8")).apply { setPadding(0, dp(10), 0, 0) }
+        root.addView(memoryView)
+        root.addView(button("Effacer toute la mémoire", Color.parseColor("#7A1F3D")) { confirmClear() })
 
         root.addView(label("Journal de DeVE", 14f).apply { setPadding(0, dp(30), 0, 0) })
         root.addView(label("Si quelque chose bloque, envoie-moi une capture de ce journal.", 12f, soft))
@@ -170,6 +184,18 @@ class MainActivity : Activity() {
         })
 
         autoStartIfReady()
+    }
+
+    private fun confirmClear() {
+        android.app.AlertDialog.Builder(this)
+            .setTitle("Effacer la mémoire ?")
+            .setMessage("DeVE oubliera tout ce qu'il a retenu sur toi.")
+            .setPositiveButton("Effacer") { _, _ ->
+                Memory.clear(this)
+                refresh()
+            }
+            .setNegativeButton("Annuler", null)
+            .show()
     }
 
     private fun autoStartIfReady() {
@@ -226,6 +252,14 @@ class MainActivity : Activity() {
                 "${m(DeveAccessibilityService.instance != null)} Accessibilité\n" +
                 "${m(keyOk)} Clé API\n" +
                 "${m(DeveService.running)} DeVE actif"
+        if (::memoryView.isInitialized) {
+            val facts = Memory.facts(this)
+            memoryView.text = if (facts.isEmpty()) {
+                "(vide pour l'instant)"
+            } else {
+                "${facts.size} souvenir(s)\n" + facts.takeLast(15).joinToString("\n") { "• ${it.text}" }
+            }
+        }
         if (::journal.isInitialized) {
             journal.text = prefs.getString("trace", "")?.ifBlank { "(vide pour l'instant)" }
         }

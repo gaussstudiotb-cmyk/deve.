@@ -19,6 +19,25 @@ object LocalParser {
             .replace(Regex("\\s+"), " ")
             .trim()
 
+    // Mémoire : appliquée au texte brut pour garder les accents du souvenir.
+    private val REMEMBER = Regex(
+        "^(?:retiens|retenir|souviens[- ]toi|rappelle[- ]toi|n['’ ]oublie pas|m[ée]morise[rz]?|garde en m[ée]moire)" +
+            "(?: bien)?(?: que| qu['’]| ceci| :)?\\s*(.+)$",
+        RegexOption.IGNORE_CASE
+    )
+    private val REMEMBER2 = Regex(
+        "^(?:note|noter|enregistre)(?: bien)? (?:que|qu['’]|:)\\s*(.+)$", RegexOption.IGNORE_CASE
+    )
+    private val FORGET = Regex(
+        "^(?:oublie|oublier|efface|supprime)(?: de ta m[ée]moire)?" +
+            "(?: que | qu['’]| tout ce qui concerne | ce que je t['’]ai dit (?:sur|à propos de) )?\\s*(.+)$",
+        RegexOption.IGNORE_CASE
+    )
+    private val END = Regex(
+        "^(?:merci|merci beaucoup|c est tout|ca sera tout|ca sera tout merci|stop|annule|laisse tomber|" +
+            "au revoir|a plus tard|a plus|bye|tais toi|silence)$"
+    )
+
     private val POLITE_START = Regex(
         "^(?:(?:s il te plait|stp|peux tu|tu peux|pourrais tu|veux tu|je veux|je voudrais|j aimerais|deve|dev) )+"
     )
@@ -56,10 +75,22 @@ object LocalParser {
     )
 
     fun parse(raw: String): Brain.Call? {
+        val r = raw.trim()
+        (REMEMBER.find(r) ?: REMEMBER2.find(r))?.let { m ->
+            val fact = m.groupValues[1].trim()
+            if (fact.length >= 3) return Brain.Call("memoriser", JSONObject().put("fait", fact))
+        }
+        FORGET.find(r)?.let { m ->
+            val kw = m.groupValues[1].trim()
+            if (kw.isNotEmpty()) return Brain.Call("oublier", JSONObject().put("mot_cle", kw))
+        }
+
         var t = norm(raw)
         t = POLITE_START.replace(t, "")
         t = POLITE_END.replace(t, "").trim()
         if (t.isEmpty()) return null
+
+        if (END.matches(t)) return Brain.Call("fin", JSONObject().put("merci", t.startsWith("merci")))
 
         if (QUIT.matches(t)) return Brain.Call("quitter_app", JSONObject())
 

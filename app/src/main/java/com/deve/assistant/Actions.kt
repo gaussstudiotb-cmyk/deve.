@@ -27,7 +27,29 @@ class Actions(private val ctx: Context, private val svc: DeveService) {
         "quitter_app" -> quit()
         "enregistrer_audio" -> record(a.optInt("duree_secondes", 60))
         "alarme" -> alarm(a.optInt("heure", -1), a.optInt("minute", 0), a.optString("message"))
+        "memoriser" -> remember(a.optString("fait"))
+        "oublier" -> forget(a.optString("mot_cle"))
+        "fin" -> Plan(if (a.optBoolean("merci")) "Avec plaisir !" else "D'accord.")
         else -> Plan("Je ne sais pas encore faire ça.")
+    }
+
+    // ---------- Mémoire ----------
+    private fun remember(fact: String): Plan {
+        if (fact.isBlank()) return Plan("Que dois-je retenir ?")
+        return Plan("C'est noté.") { Memory.add(ctx, fact) }
+    }
+
+    private fun forget(keyword: String): Plan {
+        val k = Memory.norm(keyword)
+        if (k.isEmpty()) return Plan("Que dois-je oublier ?")
+        if (k == "tout" || k == "tous" || k.contains("memoire")) {
+            return Plan("Pour tout effacer, utilise le bouton dans l'appli DeVE.")
+        }
+        val n = Memory.count(ctx, keyword)
+        if (n == 0) return Plan("Je n'avais rien noté à ce sujet.")
+        return Plan(if (n == 1) "D'accord, j'ai oublié ce souvenir." else "D'accord, j'ai oublié $n souvenirs.") {
+            Memory.remove(ctx, keyword)
+        }
     }
 
     private fun has(p: String) = ctx.checkSelfPermission(p) == PackageManager.PERMISSION_GRANTED
