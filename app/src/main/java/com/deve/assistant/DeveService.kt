@@ -54,7 +54,7 @@ class DeveService : Service() {
         // Mot d'éveil : « DeVE » est souvent transcrit dev / dève / dave.
         private val WAKE = Regex(
             "(?<![\\p{L}])(?:deve|dève|dév|dev|dave)(?![\\p{L}])",
-            setOf(RegexOption.IGNORE_CASE, RegexOption.UNICODE_CASE)
+            setOf(RegexOption.IGNORE_CASE)
         )
     }
 
