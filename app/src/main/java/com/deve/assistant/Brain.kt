@@ -18,8 +18,8 @@ import java.util.Locale
 class HttpException(val code: Int, message: String) : IOException(message)
 
 /**
- * Le cerveau de DeVE : envoie la phrase à Gemini (gratuit) ou à Claude, avec
- * la mémoire à long terme, le fil de la conversation et des fonctions à déclencher.
+ * Le cerveau de DeVE : Gemini ou Claude, avec basculement automatique sur l'autre si le premier échoue,
+ * la mémoire à long terme, l'historique (base SQLite partagée par les deux) et les compétences.
  * Deux profils : « rapide » pour les phrases courtes, « réfléchi » pour les vraies questions.
  */
 class Brain(private val ctx: Context, private val prefs: SharedPreferences) {
@@ -43,10 +43,12 @@ class Brain(private val ctx: Context, private val prefs: SharedPreferences) {
     private class Tool(val name: String, val desc: String, val params: List<Param>)
     private class Turn(val user: String, val reply: String)
 
-    private val history = ArrayList<Turn>()
-    private var lastTurnAt = 0L
+    /** Dernier fournisseur qui a réellement répondu (pour le journal). */
+    @Volatile
+    var lastProvider: String = "gemini"
+        private set
 
-    private val tools = listOf(
+    private val builtIn = listOf(
         Tool(
             "appeler", "Appelle une personne de ses contacts ou un numéro de téléphone.",
             listOf(Param("contact", "string", "Nom du contact ou numéro de téléphone"))
@@ -83,20 +85,32 @@ class Brain(private val ctx: Context, private val prefs: SharedPreferences) {
         )
     )
 
-    // ------------------------------------------------------------ fil de la conversation
+    // Les compétences (SMS, agenda, notifications...) sont déclarées automatiquement.
+    private val tools: List<Tool> = builtIn + Skills.all.map { s ->
+        Tool(s.name, s.description, s.params.map { Param(it.name, it.type, it.desc, it.required) })
+    }
+
+    // ------------------------------------------------------------ historique (SQLite)
+
+    private fun historyOn() = prefs.getBoolean("history_on", true)
 
     fun remember(user: String, reply: String) {
-        synchronized(history) {
-            val now = System.currentTimeMillis()
-            if (now - lastTurnAt > MEMORY_MS) history.clear()
-            history.add(Turn(user, reply))
-            while (history.size > MAX_TURNS) history.removeAt(0)
-            lastTurnAt = now
+        if (!historyOn()) return
+        try {
+            Db.get(ctx).addMessage(lastProvider, user, reply)
+        } catch (e: Exception) {
+            Log.e(TAG, "historique", e)
         }
     }
 
-    private fun recentTurns(): List<Turn> = synchronized(history) {
-        if (System.currentTimeMillis() - lastTurnAt > MEMORY_MS) emptyList() else history.toList()
+    private fun recentTurns(): List<Turn> {
+        if (!historyOn()) return emptyList()
+        return try {
+            Db.get(ctx).recent(System.currentTimeMillis() - MEMORY_MS, MAX_TURNS)
+                .map { Turn(it.first, it.second) }
+        } catch (e: Exception) {
+            emptyList()
+        }
     }
 
     // ------------------------------------------------------------ profils
@@ -142,35 +156,43 @@ class Brain(private val ctx: Context, private val prefs: SharedPreferences) {
             "en plus de lui répondre. Tu n'as pas accès à internet en direct. Nous sommes le $now.\n" + mem
     }
 
-    // ------------------------------------------------------------ appel
+    // ------------------------------------------------------------ appel avec basculement
 
     fun ask(text: String): Result {
-        val provider = prefs.getString("provider", "gemini") ?: "gemini"
-        val key = prefs.getString("key_$provider", "")?.trim().orEmpty()
-        if (key.isEmpty()) {
+        val primary = prefs.getString("provider", "gemini") ?: "gemini"
+        val secondary = if (primary == "gemini") "claude" else "gemini"
+        val usable = listOf(primary, secondary).filter { Secure.has(prefs, it) }
+        if (usable.isEmpty()) {
             return Result("Il manque la clé API. Ouvre l'appli DeVE pour la saisir.", null)
         }
         val smart = isComplex(text)
-        return try {
-            val r = if (provider == "claude") claude(text, key, smart) else gemini(text, key, smart)
-            Result(r.text?.let { cleanForSpeech(it) }, r.call)
-        } catch (e: HttpException) {
-            Log.e(TAG, "HTTP ${e.code}: ${e.message}")
-            Result(
-                when (e.code) {
-                    400, 401, 403 -> "La clé API est refusée. Vérifie-la dans l'appli DeVE."
-                    429 -> "La limite gratuite est atteinte. Réessaie dans une minute."
-                    else -> "Le service ne répond pas correctement."
-                }, null
-            )
-        } catch (e: UnknownHostException) {
-            Result("Je n'ai pas de connexion internet.", null)
-        } catch (e: SocketTimeoutException) {
-            Result("Le service met trop de temps à répondre.", null)
-        } catch (e: Exception) {
-            Log.e(TAG, "Brain error", e)
-            Result("Une erreur est survenue.", null)
+        var last = Result("Une erreur est survenue.", null)
+        for (p in usable) {
+            try {
+                val key = Secure.get(prefs, p)
+                val r = if (p == "claude") claude(text, key, smart) else gemini(text, key, smart)
+                lastProvider = p
+                return Result(r.text?.let { cleanForSpeech(it) }, r.call)
+            } catch (e: Exception) {
+                Log.e(TAG, "Échec avec $p", e)
+                last = errorResult(e)
+                if (e is UnknownHostException) break   // pas d'internet : inutile d'essayer l'autre
+            }
         }
+        return last
+    }
+
+    private fun errorResult(e: Exception): Result = when (e) {
+        is HttpException -> Result(
+            when (e.code) {
+                400, 401, 403 -> "La clé API est refusée. Vérifie-la dans l'appli DeVE."
+                429 -> "La limite gratuite est atteinte. Réessaie dans une minute."
+                else -> "Le service ne répond pas correctement."
+            }, null
+        )
+        is UnknownHostException -> Result("Je n'ai pas de connexion internet.", null)
+        is SocketTimeoutException -> Result("Le service met trop de temps à répondre.", null)
+        else -> Result("Une erreur est survenue.", null)
     }
 
     private fun cleanForSpeech(s: String): String =

@@ -38,6 +38,24 @@ object LocalParser {
             "au revoir|a plus tard|a plus|bye|tais toi|silence)$"
     )
 
+    private val SEND_SMS = Regex(
+        "^(?:envoie|envoyer|écris|écrire|ecris|ecrire)(?: un| une)? (?:sms|message|texto)(?: à| a| au)? " +
+            "(.+?) (?:pour dire(?: que)?|disant(?: que)?|qui dit|:) ?(.+)$",
+        RegexOption.IGNORE_CASE
+    )
+    private val SWITCH = Regex(
+        "^(?:passe|bascule|utilise|change)(?: sur| en| avec| vers)? (claude|gemini)$|^change de cerveau$"
+    )
+    private val READ_SMS = Regex(
+        "^(?:lis|lire|donne|dis)(?: moi)?(?: mes| mon| le| les)?(?: derniers?)? (?:sms|messages?|textos?)$"
+    )
+    private val READ_NOTIF = Regex(
+        "^(?:lis|lire|donne|dis)(?: moi)?(?: mes| mon| le| les)?(?: dernieres?)? notifications?$"
+    )
+    private val AGENDA = Regex(
+        "^(?:mon agenda|mes rendez vous|qu est ce que j ai|j ai quoi|quoi de prevu)(?: .*)?$"
+    )
+
     private val POLITE_START = Regex(
         "^(?:(?:s il te plait|stp|peux tu|tu peux|pourrais tu|veux tu|je veux|je voudrais|j aimerais|deve|dev) )+"
     )
@@ -85,12 +103,32 @@ object LocalParser {
             if (kw.isNotEmpty()) return Brain.Call("oublier", JSONObject().put("mot_cle", kw))
         }
 
+        SEND_SMS.find(r)?.let { m ->
+            val who = m.groupValues[1].trim()
+            val body = m.groupValues[2].trim()
+            if (who.isNotEmpty() && body.isNotEmpty()) {
+                return Brain.Call("envoyer_sms", JSONObject().put("contact", who).put("message", body))
+            }
+        }
+
         var t = norm(raw)
         t = POLITE_START.replace(t, "")
         t = POLITE_END.replace(t, "").trim()
         if (t.isEmpty()) return null
 
         if (END.matches(t)) return Brain.Call("fin", JSONObject().put("merci", t.startsWith("merci")))
+
+        SWITCH.find(t)?.let { m ->
+            return Brain.Call("fournisseur", JSONObject().put("nom", m.groupValues[1]))
+        }
+        if (READ_SMS.matches(t)) return Brain.Call("lire_sms", JSONObject())
+        if (READ_NOTIF.matches(t)) return Brain.Call("lire_notifications", JSONObject())
+        if (AGENDA.matches(t)) {
+            return Brain.Call(
+                "lire_agenda",
+                JSONObject().put("jour", if (t.contains("demain")) "demain" else "aujourd'hui")
+            )
+        }
 
         if (QUIT.matches(t)) return Brain.Call("quitter_app", JSONObject())
 

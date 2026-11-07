@@ -63,6 +63,16 @@ class DeveService : Service() {
             setOf(RegexOption.IGNORE_CASE)
         )
 
+        // Réponses à une demande de confirmation (texte déjà normalisé : minuscules, sans accents).
+        private val YES = Regex(
+            "^(?:oui|ouais|yes|ok|okay|d accord|vas y|go|confirme|confirmer|bien sur|carrement|" +
+                "c est bon|envoie|appelle|fais le|allez y)(?: .*)?$"
+        )
+        private val NO = Regex(
+            "^(?:non|nan|annule|annuler|stop|laisse tomber|pas maintenant|surtout pas|n envoie pas|" +
+                "n appelle pas|arrete)(?: .*)?$"
+        )
+
         /** Notification « touche pour réactiver » quand Android refuse le démarrage automatique. */
         fun notifyRestart(ctx: Context) {
             val nm = ctx.getSystemService(NotificationManager::class.java)
@@ -106,6 +116,10 @@ class DeveService : Service() {
     private var requestId = 0
     private var pendingAction: (() -> Unit)? = null
     private var deferredSay: String? = null
+
+    private class Pending(val name: String, val plan: Plan, val userText: String)
+
+    private var awaiting: Pending? = null
 
     private var orb: OrbView? = null
 
@@ -436,6 +450,7 @@ class DeveService : Service() {
 
     private fun backToWake() {
         main.removeCallbacks(partialCommit)
+        awaiting = null
         mode = Mode.WAKE
         activated = false
         hideOrb()
@@ -453,6 +468,25 @@ class DeveService : Service() {
         trace("entendu : $text")
         val id = ++requestId
 
+        // 0) Réponse à une demande de confirmation (« oui » / « non »).
+        val pending = awaiting
+        if (pending != null) {
+            awaiting = null
+            val answer = Memory.norm(text)
+            if (YES.matches(answer)) {
+                trace("confirmé : ${pending.name}")
+                perform(pending.name, pending.plan, pending.userText, null)
+                return
+            }
+            if (NO.matches(answer)) {
+                trace("annulé : ${pending.name}")
+                Db.get(this).logAction(pending.name, "annulé par l'utilisateur", false)
+                say("D'accord, j'annule.")
+                return
+            }
+            // ni oui ni non : on abandonne l'action et on traite la phrase comme une nouvelle demande
+        }
+
         // 1) Commande simple : exécutée tout de suite, sans IA.
         val local = LocalParser.parse(text)
         if (local != null) {
@@ -468,11 +502,11 @@ class DeveService : Service() {
                 if (id != requestId || !running) return@post
                 val call = r.call
                 if (call != null) {
-                    trace("IA : ${call.name}")
+                    trace("IA (${brain.lastProvider}) : ${call.name}")
                     execute(call, text, r.text)
                 } else {
                     val reply = r.text ?: "Je n'ai pas compris."
-                    trace("IA : réponse")
+                    trace("IA (${brain.lastProvider}) : réponse")
                     brain.remember(text, reply)
                     keepTalking = true   // la conversation continue : on reste à l'écoute après la réponse
                     say(reply)
@@ -481,29 +515,46 @@ class DeveService : Service() {
         }
     }
 
-    /** Exécute l'action tout de suite, puis annonce le résultat à voix haute. */
+    /** Prépare l'action : demande confirmation si elle est sensible, sinon l'exécute tout de suite. */
     private fun execute(call: Brain.Call, userText: String, modelText: String?) {
         val plan = actions.plan(call.name, call.args)
+        val ask = plan.confirm
+        if (ask != null && (plan.strict || prefs.getBoolean("confirm_sensitive", true))) {
+            awaiting = Pending(call.name, plan, userText)
+            keepTalking = true   // on reste à l'écoute pour entendre « oui » ou « non »
+            trace("confirmation demandée : ${call.name}")
+            say(ask)
+            return
+        }
+        perform(call.name, plan, userText, modelText)
+    }
+
+    /** Exécute l'action, la note dans le journal, puis annonce le résultat à voix haute. */
+    private fun perform(name: String, plan: Plan, userText: String, modelText: String?) {
         var message = plan.message
-        if (call.name == "memoriser" && !modelText.isNullOrBlank()) {
+        if (name == "memoriser" && !modelText.isNullOrBlank()) {
             message = modelText          // l'IA a répondu ET noté le souvenir
             keepTalking = true
         }
+        val reply = if (plan.privateReply) "(lecture de données privées)" else message
         if (plan.afterSpeech) {
-            brain.remember(userText, message)
+            Db.get(this).logAction(name, userText.take(80), true)
+            brain.remember(userText, reply)
             say(message, plan.run)
             return
         }
         try {
             plan.run?.invoke()
-            trace("action ${call.name} : lancée")
+            trace("action $name : lancée")
+            Db.get(this).logAction(name, userText.take(80), true)
         } catch (e: Exception) {
             Log.e(TAG, "Action échouée", e)
-            trace("action ${call.name} échouée : ${e.javaClass.simpleName}")
+            trace("action $name échouée : ${e.javaClass.simpleName}")
+            Db.get(this).logAction(name, userText.take(80), false)
             say("Je n'ai pas réussi à le faire.")
             return
         }
-        brain.remember(userText, message)
+        brain.remember(userText, reply)
         say(message)
     }
 

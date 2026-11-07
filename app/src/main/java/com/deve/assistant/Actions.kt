@@ -16,8 +16,15 @@ class Plan(
     val message: String,
     /** true : on parle d'abord, puis on exécute (utile pour l'enregistrement, pour ne pas s'enregistrer soi-même). */
     val afterSpeech: Boolean = false,
+    /** Si renseigné : DeVE pose cette question et attend « oui » avant d'agir. */
+    val confirm: String? = null,
+    /** true : confirmation obligatoire, même si les confirmations d'appel sont désactivées. */
+    val strict: Boolean = false,
     val run: (() -> Unit)? = null
-)
+) {
+    /** true : le message contient des données privées (SMS, agenda...) : on ne le garde pas dans l'historique. */
+    var privateReply: Boolean = false
+}
 
 class Actions(private val ctx: Context, private val svc: DeveService) {
 
@@ -30,7 +37,26 @@ class Actions(private val ctx: Context, private val svc: DeveService) {
         "memoriser" -> remember(a.optString("fait"))
         "oublier" -> forget(a.optString("mot_cle"))
         "fin" -> Plan(if (a.optBoolean("merci")) "Avec plaisir !" else "D'accord.")
-        else -> Plan("Je ne sais pas encore faire ça.")
+        "fournisseur" -> switchProvider(a.optString("nom"))
+        else -> Skills.find(name)?.plan(ctx, a) ?: Plan("Je ne sais pas encore faire ça.")
+    }
+
+    // ---------- Changer de cerveau ----------
+    private fun switchProvider(nom: String): Plan {
+        val prefs = ctx.getSharedPreferences("deve", Context.MODE_PRIVATE)
+        val current = prefs.getString("provider", "gemini") ?: "gemini"
+        val target = when (nom.lowercase(Locale.ROOT)) {
+            "claude" -> "claude"
+            "gemini" -> "gemini"
+            else -> if (current == "gemini") "claude" else "gemini"
+        }
+        val label = if (target == "claude") "Claude" else "Gemini"
+        if (!Secure.has(prefs, target)) {
+            return Plan("Tu n'as pas encore saisi de clé pour $label. Fais-le dans l'appli DeVE.")
+        }
+        return Plan("D'accord, j'utilise maintenant $label.") {
+            prefs.edit().putString("provider", target).apply()
+        }
     }
 
     // ---------- Mémoire ----------
@@ -77,7 +103,8 @@ class Actions(private val ctx: Context, private val svc: DeveService) {
             }
             number = lookupContact(who) ?: return Plan("Je ne trouve pas $who dans tes contacts.")
         }
-        return Plan("J'appelle ${if (isNumber) "ce numéro" else who}.") {
+        val label = if (isNumber) "ce numéro" else who
+        return Plan("J'appelle $label.", confirm = "Tu veux que j'appelle $label ?") {
             go(
                 Intent(Intent.ACTION_CALL, Uri.parse("tel:" + Uri.encode(number)))
                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)

@@ -32,6 +32,7 @@ class MainActivity : Activity() {
     private lateinit var keyField: EditText
     private lateinit var journal: TextView
     private lateinit var memoryView: TextView
+    private lateinit var actionsView: TextView
     private var provider = "gemini"
     private val ui = Handler(Looper.getMainLooper())
 
@@ -82,7 +83,7 @@ class MainActivity : Activity() {
         status = label("", 14f).apply { setPadding(0, dp(18), 0, dp(6)) }
         root.addView(status)
 
-        root.addView(button("1. Autoriser micro, contacts, appels", violet) { askPermissions() })
+        root.addView(button("1. Autoriser les permissions", violet) { askPermissions() })
         root.addView(button("2. Autoriser l'orbe flottante", violet) {
             startActivity(
                 Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
@@ -93,6 +94,9 @@ class MainActivity : Activity() {
         })
         root.addView(button("4. Batterie : ne pas restreindre DeVE", violet) {
             startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+        })
+        root.addView(button("5. Accès aux notifications (pour les lire)", violet) {
+            startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
         })
 
         root.addView(label("Cerveau de DeVE", 16f).apply { setPadding(0, dp(24), 0, dp(4)) })
@@ -127,13 +131,13 @@ class MainActivity : Activity() {
         group.setOnCheckedChangeListener { _, id ->
             provider = if (id == rbC.id) "claude" else "gemini"
             prefs.edit().putString("provider", provider).apply()
-            keyField.setText(prefs.getString("key_$provider", ""))
+            keyField.setText(Secure.get(prefs, provider))
             refresh()
         }
         group.check(if (provider == "claude") rbC.id else rbG.id)
 
         root.addView(button("Enregistrer la clé", rose) {
-            prefs.edit().putString("key_$provider", keyField.text.toString().trim()).apply()
+            Secure.put(prefs, provider, keyField.text.toString())
             Toast.makeText(this, "Clé enregistrée", Toast.LENGTH_SHORT).show()
             refresh()
         })
@@ -153,6 +157,22 @@ class MainActivity : Activity() {
             isChecked = prefs.getBoolean("beep", true)
             setOnCheckedChangeListener { _, on -> prefs.edit().putBoolean("beep", on).apply() }
         })
+        root.addView(android.widget.Switch(this).apply {
+            text = "Confirmer avant d'appeler"
+            setTextColor(Color.WHITE)
+            setPadding(0, dp(14), 0, 0)
+            isChecked = prefs.getBoolean("confirm_sensitive", true)
+            setOnCheckedChangeListener { _, on -> prefs.edit().putBoolean("confirm_sensitive", on).apply() }
+        })
+        root.addView(label("L'envoi d'un SMS demande toujours une confirmation.", 12f, soft))
+        root.addView(android.widget.Switch(this).apply {
+            text = "Garder l'historique des conversations"
+            setTextColor(Color.WHITE)
+            setPadding(0, dp(14), 0, 0)
+            isChecked = prefs.getBoolean("history_on", true)
+            setOnCheckedChangeListener { _, on -> prefs.edit().putBoolean("history_on", on).apply() }
+        })
+        root.addView(button("Effacer l'historique", Color.parseColor("#3A2A55")) { confirmClearHistory() })
 
         root.addView(button("▶  Démarrer DeVE", rose) { startDeve(false) }.apply {
             (layoutParams as LinearLayout.LayoutParams).topMargin = dp(28)
@@ -168,6 +188,10 @@ class MainActivity : Activity() {
         memoryView = label("", 11f, Color.parseColor("#9C8AB8")).apply { setPadding(0, dp(10), 0, 0) }
         root.addView(memoryView)
         root.addView(button("Effacer toute la mémoire", Color.parseColor("#7A1F3D")) { confirmClear() })
+
+        root.addView(label("Actions effectuées", 14f).apply { setPadding(0, dp(30), 0, 0) })
+        actionsView = label("", 11f, Color.parseColor("#9C8AB8")).apply { setPadding(0, dp(10), 0, 0) }
+        root.addView(actionsView)
 
         root.addView(label("Journal de DeVE", 14f).apply { setPadding(0, dp(30), 0, 0) })
         root.addView(label("Si quelque chose bloque, envoie-moi une capture de ce journal.", 12f, soft))
@@ -186,6 +210,18 @@ class MainActivity : Activity() {
         autoStartIfReady()
     }
 
+    private fun confirmClearHistory() {
+        android.app.AlertDialog.Builder(this)
+            .setTitle("Effacer l'historique ?")
+            .setMessage("DeVE oubliera le fil de vos conversations récentes (pas ses souvenirs).")
+            .setPositiveButton("Effacer") { _, _ ->
+                Db.get(this).clearMessages()
+                refresh()
+            }
+            .setNegativeButton("Annuler", null)
+            .show()
+    }
+
     private fun confirmClear() {
         android.app.AlertDialog.Builder(this)
             .setTitle("Effacer la mémoire ?")
@@ -201,7 +237,7 @@ class MainActivity : Activity() {
     private fun autoStartIfReady() {
         if (!prefs.getBoolean("autostart", true) || DeveService.running) return
         if (!has(Manifest.permission.RECORD_AUDIO)) return
-        if (prefs.getString("key_$provider", "").isNullOrBlank()) return
+        if (!Secure.has(prefs, provider)) return
         startDeve(false)
     }
 
@@ -221,7 +257,11 @@ class MainActivity : Activity() {
         val list = mutableListOf(
             Manifest.permission.RECORD_AUDIO,
             Manifest.permission.READ_CONTACTS,
-            Manifest.permission.CALL_PHONE
+            Manifest.permission.CALL_PHONE,
+            Manifest.permission.SEND_SMS,
+            Manifest.permission.READ_SMS,
+            Manifest.permission.READ_CALENDAR,
+            Manifest.permission.WRITE_CALENDAR
         )
         if (Build.VERSION.SDK_INT >= 33) list.add(Manifest.permission.POST_NOTIFICATIONS)
         requestPermissions(list.toTypedArray(), 1)
@@ -232,7 +272,7 @@ class MainActivity : Activity() {
             Toast.makeText(this, "Autorise d'abord le micro (étape 1).", Toast.LENGTH_LONG).show()
             return
         }
-        if (prefs.getString("key_$provider", "").isNullOrBlank()) {
+        if (!Secure.has(prefs, provider)) {
             Toast.makeText(this, "Pense à saisir une clé API.", Toast.LENGTH_LONG).show()
         }
         val i = Intent(this, DeveService::class.java)
@@ -243,15 +283,26 @@ class MainActivity : Activity() {
 
     private fun refresh() {
         fun m(ok: Boolean) = if (ok) "✅" else "⬜"
-        val keyOk = !prefs.getString("key_$provider", "").isNullOrBlank()
+        val keyOk = Secure.has(prefs, provider)
         status.text =
             "${m(has(Manifest.permission.RECORD_AUDIO))} Micro   " +
                 "${m(has(Manifest.permission.READ_CONTACTS))} Contacts   " +
                 "${m(has(Manifest.permission.CALL_PHONE))} Appels\n" +
+                "${m(has(Manifest.permission.SEND_SMS))} SMS   " +
+                "${m(has(Manifest.permission.READ_CALENDAR))} Agenda   " +
+                "${m(DeveNotificationListener.connected)} Notifications\n" +
                 "${m(Settings.canDrawOverlays(this))} Orbe flottante\n" +
                 "${m(DeveAccessibilityService.instance != null)} Accessibilité\n" +
                 "${m(keyOk)} Clé API\n" +
                 "${m(DeveService.running)} DeVE actif"
+        if (::actionsView.isInitialized) {
+            val list = try {
+                Db.get(this).recentActions(8)
+            } catch (e: Exception) {
+                emptyList()
+            }
+            actionsView.text = if (list.isEmpty()) "(aucune pour l'instant)" else list.joinToString("\n")
+        }
         if (::memoryView.isInitialized) {
             val facts = Memory.facts(this)
             memoryView.text = if (facts.isEmpty()) {
